@@ -1,0 +1,516 @@
+---
+title: "Ros_paper"
+output: html_document
+date: '2023-02-16'
+---
+This is a script by Jens Bager Christensen to perform pseudobulk analysis on ASCL1-NEPs to identify their transcriptional response to neonatal injury.
+
+```{r}
+#Load packages
+library(Seurat)
+library(tidyverse)
+library(DESeq2)
+library(EnhancedVolcano)
+library(goseq)
+
+#Defining parameters to test different resolutions for clustering
+res.range <- c(seq(0.1,2,0.1))
+assay <- "SCT"
+dims <- 20
+reduction <- "pca"
+
+#Defining a function, which clusters a RDS in a range of resolutions, and calculates both the silhouette score and the negative silhouette proportion to determine which resolution is optimal
+clusteringKit <- function(name, assay, dim, res.range, reduction){
+  DefaultAssay(name) <- assay
+  #using FindNeighbors (Seurat), a KNN based clustering algorithm, to compute a SNN graph, which then can be used to cluster the cells w. their neighbors
+  name <- FindNeighbors(name, dims=1:dim, reduction=reduction)
+  for (i in res.range){
+    #FindClusters is used to cluster the aforementioned SNN graph by optimising the modularity function. This is carried out for all resolutions in the range of interest.
+    name <- FindClusters(name, resolution=i)
+  }
+DefaultAssay(name) <- assay
+  dist.matrix <- dist(x = Embeddings(object = name[[reduction]])[, 1:dim])
+ clusters <- paste0(assay,"_snn_res.", res.range)
+  getSil <- function(clr) {
+    clr <- name@meta.data[[clr]]
+    sil <- cluster::silhouette(x = as.numeric(x = as.factor(x = clr)), dist = dist.matrix)
+    sil_value <- sil
+    return(sil_value)
+  }
+  
+  sls <- lapply(clusters, getSil) #mc.cores = 1)
+  sls_median <- sapply(sls, function(x) median(x[,3])) %>% setNames(., res.range)
+  sls_neg_prop <- sapply(sls, function(x) sum(x[,3]<0)/length(x[,3])) %>% setNames(., res.range)
+  p_list <- lapply(res.range, function(res){
+    Idents(name) = name@meta.data[paste0(assay, "_snn_res.",res)]
+    DimPlot(name, reduction = "umap", label = TRUE, group.by = paste0(assay, "_snn_res.",res), pt.size =0.3, raster=F)
+  })
+  return(list(name=name, sls_median=sls_median, sls_neg_prop=sls_neg_prop, dimplots=p_list))
+}
+```
+
+
+#This is the script for performing DESeq2 analysis on Ascl1 positive NEPs to illustrate their response to injury.
+
+The RDS object is read in, which previously has been preprocessed and mapped using CellRanger.
+```{r}
+#read in the RDS object prepared previously.
+data <- readRDS(file = "~/../jbc53/data/nep.rna.combined.solo.RDS")
+
+#add cluster annotations to the metadata.
+data@meta.data <- data@meta.data %>%
+  mutate(cluster = Idents(data))
+
+#alter misspelling of a cluster name.
+data@meta.data$cluster <- recode_factor(data@meta.data$cluster, "Ependymal_!" = "Ependymal_1")
+
+#inspect the dimplot.
+DimPlot(data, label = T, label.box = T, repel = T, group.by = "cluster") & NoLegend() & NoAxes()
+
+#by cluster.
+DimPlot(data, label = F, label.box = T, repel = T, group.by = "seurat_clusters") & NoAxes()
+
+#Identify markers for each cluster.
+DefaultAssay(data) <- 'RNA'
+Idents(data) <- data@meta.data$seurat_clusters
+data.markers <- FindAllMarkers(data, only.pos = TRUE, min.pct = 0.10, logfc.threshold = 0.25)
+
+#Write a csv of the clustering analysis.
+#write.csv(data.markers, file = "All.markers.csv")
+```
+
+Visualising expression changing in time in Hopx positive clusters
+```{r}
+#setting a seed, ensuring consistent clustering
+set.seed(123)
+
+#Inspect Ascl1 expression in a featureplot and a violin plot to determine which clusters to include.
+FeaturePlot(data, features = "Ascl1") & NoAxes()
+VlnPlot(data, features = "Ascl1", group.by = "cluster", sort = "increasing")
+#clusters Ascl1_NEP_1, -2, and interneuron are deemed Ascl1 positive and and thus used for further analysis.
+
+#create the subset, excluding P1 cells.
+Idents(data) <- data@meta.data$cluster
+Ascl1_all <- subset(data, idents = c("Ascl1_NEP_1","Ascl1_NEP_2","Interneuron")) %>% subset(timepoint != "P1")
+
+#plot expression changing with time of genes of interest. Reordering the levels to make nonIR first.
+Ascl1_all@meta.data$treatment <- factor(Ascl1_all@meta.data$treatment, levels = c("nonIR", "IR"))
+VlnPlot(Ascl1_all, features = "Cdkn1a", group.by = "timepoint", split.by = "treatment")
+VlnPlot(Ascl1_all, features = "Phlda3", group.by = "timepoint", split.by = "treatment")
+VlnPlot(Ascl1_all, features = "Ass1", group.by = "timepoint", split.by = "treatment")
+VlnPlot(Ascl1_all, features = "Bax", group.by = "timepoint", split.by = "treatment")
+VlnPlot(Ascl1_all, features = "Ano3", group.by = "timepoint", split.by = "treatment")
+VlnPlot(Ascl1_all, features = "Fas", group.by = "timepoint", split.by = "treatment")
+```
+
+We're interested in the Ascl1 expressing NEPs. Clusters identified as ASCL1-NEPs and their progeny are subsetted. To divide the initial, acute injury response with later biological reactions, the data is split into P2 cells and P3+P5 cells. Pseudobulk analysis is performed on these two data set seperately.   
+```{r}
+#setting a seed, ensuring consistent clustering.
+set.seed(123)
+
+#Inspect Ascl1 expression in a featureplot and a violin plot to determine which clusters to include.
+FeaturePlot(data, features = "Ascl1") & NoAxes()
+VlnPlot(data, features = "Ascl1", group.by = "cluster", sort = "increasing")
+#clusters Ascl1_NEP_1, -2, and interneuron are deemed Ascl1 positive and and thus used for further analysis
+
+#subset the the ASCL1-NEPs and their progeny from P2.
+Ascl1_p2 <- subset(data, idents = c("Ascl1_NEP_1","Ascl1_NEP_2","Interneuron")) %>% subset(timepoint == "P2")
+
+#split the object allowing for reintegration.
+Ascl1_p2_list <- SplitObject(Ascl1_p2, split.by = "orig.ident")
+
+
+#Re-integrate datasets.
+Ascl1_p2_list <- lapply(X = Ascl1_p2_list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 3000)
+})
+
+
+#select features that are repeatedly variable across datasets for integration.
+features.Ascl1_p2 <- SelectIntegrationFeatures(object.list = Ascl1_p2_list)
+rna.anchors.Ascl1_p2 <- FindIntegrationAnchors(object.list = Ascl1_p2_list, anchor.features = features.Ascl1_p2)
+
+#this command creates an 'integrated' data assay. k.weight set to 50 to accommodate the small data set.
+Ascl1_p2 <- IntegrateData(anchorset = rna.anchors.Ascl1_p2, k.weight = 50)
+
+#regress out CC, mitrochondrial -, gene reads, and sequencing depth.
+Ascl1_p2 <- SCTransform(Ascl1_p2, vars.to.regress = c("percent.mt", "CC.Difference", "nFeature_RNA", "nCount_RNA"))
+
+#run PCA and UMAP w. parameters previously used.
+Ascl1_p2 <- RunPCA(Ascl1_p2, features = Ascl1_p2@assays$integrated@var.features, npcs = 100)
+Ascl1_p2 <- RunUMAP(Ascl1_p2, dims = 1:40, n.neighbours = 30L, seed.use = 888, repulsion.strength = 0.1, min.dist = 0.5, n.epochs = NULL)
+
+#Visualise the data.
+DimPlot(Ascl1_p2, label = T, label.box = T, repel = T) + ggtitle("UMAP of subsetted NEP types") & NoLegend() & NoAxes()
+
+#Recluster the data trying out different clustering resolutions to figure out an optimal resolution.
+Ascl1_p2_combined <- clusteringKit(Ascl1_p2, assay="SCT", dim=30, res.range=seq(0.1, 3, 0.1), reduction="pca")
+
+#plot to find the higest silhouette score w. low negative silhouette proportion.
+plot(Ascl1_p2_combined$sls_median~seq(0.1,3,0.1), type = "l", ylab = "Silhouette score") & plot(Ascl1_p2_combined$sls_neg_prop~seq(0.1,3,0.1), type = "l", ylab = "Negative silhouette proportion score")
+#optimal resolution is seemingly around 0.3 - 0.4. The resolutions are evaluated for biological relevance to determine the actual optimal resolution.
+
+#rename the Seurat objects.
+Ascl1_p2 <- Ascl1_p2_combined$name
+
+#Plot with the new resolutions.
+DimPlot(Ascl1_p2, label = T, label.box = T, repel = T, group.by = "SCT_snn_res.0.3") + ggtitle("Cells from Ascl1 positive clusters from P2") & NoLegend() & NoAxes()
+DimPlot(Ascl1_p2, label = F, label.box = T, repel = T, group.by = "timepoint", pt.size = 2) + ggtitle("Cells from Ascl1 positive clusters from P2") & NoAxes()
+DimPlot(Ascl1_p2, label = F, label.box = T, repel = T, group.by = "treatment", pt.size = 2) + ggtitle("Cells from Ascl1 positive clusters from P2") & NoAxes()
+DimPlot(Ascl1_p2, label = F, label.box = T, repel = T, group.by = "cluster", pt.size = 2) + ggtitle("Cells from Ascl1 positive clusters from P2") & NoAxes()
+
+#See the Ascl1 expression in the subset.
+FeaturePlot(Ascl1_p2, features = "Ascl1") & NoAxes()
+VlnPlot(Ascl1_p2, features = "Ascl1", group.by = "cluster", sort = "increasing")
+```
+
+
+Performing the pseudobulk DEG analysis on only cells from P2, trying to capture the initial injury signal. Additionally, this matches the timepoint of the other experiments.
+```{r}
+#Choose the RDS object containing the cell of interest.
+Ascl1_p2_deseq2 <- Ascl1_p2 
+
+#make a sample column in the meta data.
+Ascl1_p2_deseq2@meta.data$samples <- paste0(Ascl1_p2_deseq2$orig.ident)
+
+#Aggregate the count matrixes from the RDS object.
+Ascl1_p2_cts <- AggregateExpression(Ascl1_p2_deseq2, group.by = c("samples", "treatment"),
+                           assays = "RNA",
+                           slot = "counts",
+                           return.seurat = F)
+
+#ensure the active assay is the RNA assay.
+Ascl1_p2_cts <- Ascl1_p2_cts$RNA
+
+#create a tibble containing the meta data necessary for performing the correct comparisons.
+Ascl1_p2_colData <- tibble(samples = colnames(Ascl1_p2_cts))
+Ascl1_p2_colData <- Ascl1_p2_colData %>% mutate(condition = ifelse(grepl('non', samples), 'nonIR', 'IR')) %>% column_to_rownames(var = 'samples')
+
+#create an object suitable for a DESeq2 analysos.
+Ascl1_p2_dds <- DESeqDataSetFromMatrix(countData = Ascl1_p2_cts,
+                              colData = Ascl1_p2_colData,
+                              design = ~ condition)
+
+#remove too lowly expressed genes.
+Ascl1_p2_keep <- rowSums(counts(Ascl1_p2_dds)) >= 10
+Ascl1_p2_dds <- Ascl1_p2_dds[Ascl1_p2_keep,]
+
+#perform the actual DESeq2 analysis
+Ascl1_p2_dds <- DESeq(Ascl1_p2_dds)
+
+#identify the results of interest and save it in a variable.
+resultsNames(Ascl1_p2_dds)
+Ascl1_p2_res <- results(Ascl1_p2_dds, name = "condition_nonIR_vs_IR")
+
+#visualise the results of the DESeq2 analysis in a volano plot.
+EnhancedVolcano(Ascl1_p2_res, lab = row.names(Ascl1_p2_res), x = 'log2FoldChange', y = 'padj', pCutoff = 0.05, FCcutoff = 0.5, labSize = 4, cutoffLineType = "blank", xlab = "Log fold-change", ylab = "-Log adjusted p-val" ,   colAlpha = 1, legendPosition = 'right', legendLabSize = 12, legendIconSize = 4.0, drawConnectors = T) & NoLegend()
+
+#Write a csv of the DESeq2 results
+#write.csv(Ascl1_p2_res, file = "Ascl1/Ascl1_P2_DESeq2.csv")
+```
+
+
+Performing GO term analysis to see, if any ROS related pathways are upregulated in the IR cells
+```{r}
+#restructuring the DESeq2 results making it fit for GO term analysis
+Ascl1_p2_res_go <- Ascl1_p2_res %>% as.tibble() %>% transform(gene = row.names(Ascl1_p2_res))
+
+#identify the genes which are significantly differentially expressed in the IR cells. 
+Ascl1_p2_isSigGene <- Ascl1_p2_res_go$padj < 0.05 & !is.na(Ascl1_p2_res_go$padj) & Ascl1_p2_res_go$log2FoldChange < -0.5
+Ascl1_p2_genes <- as.integer(Ascl1_p2_isSigGene)
+names(Ascl1_p2_genes) <- Ascl1_p2_res_go$gene
+
+#calculate a probability weight function for the significantly DE genes in IR cells.
+Ascl1_p2_pwf <- nullp(Ascl1_p2_genes, "mm8", "geneSymbol")
+
+#perform the goseq analysis.
+Ascl1_p2_goResults <- goseq(Ascl1_p2_pwf, "mm8","geneSymbol", test.cats=c("GO:BP"))
+
+#visualise the top 10 overrepresented GO terms.
+Ascl1_p2_goResults %>% 
+    top_n(10, wt=-over_represented_pvalue) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count", title = "GO term analysis for IR cells from P2") + theme_bw()
+
+#visualisation of selected GO terms.
+Ascl1_p2_goResults %>% 
+    subset(category %in% c("GO:0072331", "GO:0072332", "GO:0008630", "GO:0001558", "GO:0030308", "GO:0051209", "GO:0030330", "GO:0000079")) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count", title = "GO term analysis for IR cells from P2 of Ascl1 positive clusters") + theme_bw()
+
+
+#look a stress-related GO terms to see if any of these are significantly overrepresented.
+Ascl1_p2_goResults[grep("stress", Ascl1_p2_goResults$term), ]
+
+#Write a csv of the GO term results
+#write.csv(Ascl1_p2_goResults, file = "Ascl1/Ascl1_P2_GO_term.csv")
+```
+
+Performing GO term analysis on down regulated genes at P2 to compare with the upregulated genes at P2.
+```{r}
+#restructuring the DESeq2 results making it fit for GO term analysis.
+Ascl1_p2_res_go <- Ascl1_p2_res %>% as.tibble() %>% transform(gene = row.names(Ascl1_p2_res))
+
+#identify the genes which are significantly differentially expressed in the nonIR cells.
+Ascl1_p2_isSigGene_nonIR <- Ascl1_p2_res_go$padj < 0.05 & !is.na(Ascl1_p2_res_go$padj) & Ascl1_p2_res_go$log2FoldChange > 0.5
+Ascl1_p2_genes_nonIR <- as.integer(Ascl1_p2_isSigGene_nonIR)
+names(Ascl1_p2_genes_nonIR) <- Ascl1_p2_res_go$gene
+
+#calculate a probability weight function for the significantly DE genes in IR cells.
+Ascl1_p2_pwf_nonIR <- nullp(Ascl1_p2_genes_nonIR, "mm8", "geneSymbol")
+
+#perform the goseq analysis
+Ascl1_p2_goResults_nonIR <- goseq(Ascl1_p2_pwf_nonIR, "mm8","geneSymbol", test.cats=c("GO:BP"))
+
+#visualise the top 10 overrepresented GO terms.
+Ascl1_p2_goResults_nonIR %>% 
+    top_n(10, wt=-over_represented_pvalue) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count", title = "GO term analysis for IR cells from P2") + theme_bw()
+
+#visualisation of selected GO terms.
+Ascl1_p2_goResults %>% 
+    subset(category %in% c("GO:0072331", "GO:0072332", "GO:0008630", "GO:0001558", "GO:0030308", "GO:0051209", "GO:0030330", "GO:0000079")) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count", title = "GO term analysis for IR cells from P2 of Ascl1 positive clusters") + theme_bw()
+
+
+#look a stress-related GO terms to see if any of these are significantly overrepresented
+Ascl1_p2_goResults_nonIR[grep("stress", Ascl1_p2_goResults_nonIR$term), ]
+
+#Write a csv of the GO term results
+#write.csv(Ascl1_p2_goResults_nonIR, file = "Ascl1/Ascl1_P2_GO_term_nonIR.csv")
+```
+
+
+Doing the analysis using P3 + P5 cells, expecting the ROS signal has subsided by then.
+```{r}
+#setting a seed, ensuring consistent clustering.
+set.seed(123)
+
+#inspect Ascl1 expression.
+FeaturePlot(data, features = "Ascl1") & NoAxes()
+VlnPlot(data, features = "Ascl1", group.by = "cluster", sort = "increasing") & NoLegend()
+#clusters Ascl1_NEP_1, Ascl1_NEP_2, and Interneuron are deemed Ascl1 positive and thus used for further analysis.
+
+#subset the data including all cell.
+Ascl1_late <- subset(data, idents = c("Ascl1_NEP_1", "Ascl1_NEP_2", "Interneuron")) 
+Ascl1_late <- subset(Ascl1_late, timepoint != c("P1"))
+Ascl1_late <- subset(Ascl1_late, timepoint != c("P2"))
+
+#split the object allowing for reintegration.
+Ascl1_late_list <- SplitObject(Ascl1_late, split.by = "orig.ident")
+
+
+#Re-integrate datasets.
+Ascl1_late_list <- lapply(X = Ascl1_late_list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 3000)
+})
+
+
+#select features that are repeatedly variable across datasets for integration.
+features.Ascl1_late <- SelectIntegrationFeatures(object.list = Ascl1_late_list)
+rna.anchors.Ascl1_late <- FindIntegrationAnchors(object.list = Ascl1_late_list, anchor.features = features.Ascl1_late)
+
+#this command creates an 'integrated' data assay.
+Ascl1_late <- IntegrateData(anchorset = rna.anchors.Ascl1_late, k.weight = 50)
+
+#regress out CC, mitrochondrial -, gene reads, and sequencing depth.
+Ascl1_late <- SCTransform(Ascl1_late, vars.to.regress = c("percent.mt", "CC.Difference", "nFeature_RNA", "nCount_RNA"))
+
+#run PCA and UMAP w. parameters previously used.
+Ascl1_late <- RunPCA(Ascl1_late, features = Ascl1_late@assays$integrated@var.features, npcs = 100)
+Ascl1_late <- RunUMAP(Ascl1_late, dims = 1:40, n.neighbours = 30L, seed.use = 888, repulsion.strength = 0.1, min.dist = 0.5, n.epochs = NULL)
+
+#Visualise the data.
+DimPlot(Ascl1_late, label = T, label.box = T, repel = T) + ggtitle("UMAP of subsetted NEP types") & NoLegend() & NoAxes()
+
+#Recluster the data trying out different clustering resolutions to figure out an optimal resolution.
+Ascl1_late_combined <- clusteringKit(Ascl1_late, assay="SCT", dim=30, res.range=seq(0.1, 3, 0.1), reduction="pca")
+
+#plot to find the higest silhouette score w. low negative silhouette proportion.
+plot(Ascl1_late_combined$sls_median~seq(0.1,3,0.1), type = "l", ylab = "Silhouette score") & plot(Ascl1_late_combined$sls_neg_prop~seq(0.1,3,0.1), type = "l", ylab = "Negative silhouette proportion score")
+#optimal resolution is seemingly around 0.2 - 0.3. The resolutions are evaluated for biological relevance to determine the actual optimal resolution.
+
+#rename the Seurat objects.
+Ascl1_late <- Ascl1_late_combined$name
+
+#Plot with the new resolutions.
+DimPlot(Ascl1_late, label = T, label.box = T, repel = T, group.by = "SCT_snn_res.0.3") + ggtitle("Cells from Ascl1 positive clusters from P3 and P5") & NoLegend() & NoAxes()
+DimPlot(Ascl1_late, label = F, label.box = T, repel = T, group.by = "timepoint", pt.size = 2) + ggtitle("Cells from Ascl1 positive clusters from P3 and P5") & NoAxes()
+DimPlot(Ascl1_late, label = F, label.box = T, repel = T, group.by = "treatment", pt.size = 2) + ggtitle("Cells from Ascl1 positive clusters from P3 and P5") & NoAxes()
+DimPlot(Ascl1_late, label = F, label.box = T, repel = T, group.by = "cluster", pt.size = 2) + ggtitle("Cells from Ascl1 positive clusters from P3 and P5") & NoAxes()
+
+#Inspect Ascl1 expression in a featureplot and a violin plot to determine which clusters to incllude.
+FeaturePlot(Ascl1_late, features = "Ascl1") & NoAxes()
+VlnPlot(Ascl1_late, features = "Ascl1", group.by = "cluster", sort = "increasing")
+```
+
+
+Performing the pseudobulk DEG analysis on cells from P3 and P5 mice. These results will provide a comparison for the initial analysis.
+```{r}
+#Choose the RDS object containing the cell of interest.
+Ascl1_late_deseq2 <- Ascl1_late 
+
+#make a sample column in the meta data.
+Ascl1_late_deseq2@meta.data$samples <- paste0(Ascl1_late_deseq2$orig.ident)
+
+#Aggregate the count matrixes from the RDS object.
+Ascl1_late_cts <- AggregateExpression(Ascl1_late_deseq2, group.by = c("samples", "treatment"),
+                           assays = "RNA",
+                           slot = "counts",
+                           return.seurat = F)
+
+#ensure the active assay is the RNA assay.
+Ascl1_late_cts <- Ascl1_late_cts$RNA
+
+#create a tibble containing the meta data necessary for performing the correct comparisons.
+Ascl1_late_colData <- tibble(samples = colnames(Ascl1_late_cts))
+Ascl1_late_colData <- Ascl1_late_colData %>% mutate(condition = ifelse(grepl('non', samples), 'nonIR', 'IR')) %>% column_to_rownames(var = 'samples')
+
+#create an object suitable for a DESeq2 analysis.
+Ascl1_late_dds <- DESeqDataSetFromMatrix(countData = Ascl1_late_cts,
+                              colData = Ascl1_late_colData,
+                              design = ~ condition)
+
+#remove too lowly expressed genes.
+Ascl1_late_keep <- rowSums(counts(Ascl1_late_dds)) >= 10
+Ascl1_late_dds <- Ascl1_late_dds[Ascl1_late_keep,]
+
+#perform the actual DESeq2 analysis.
+Ascl1_late_dds <- DESeq(Ascl1_late_dds)
+
+#identify the results of interest and save it in a variable.
+resultsNames(Ascl1_late_dds)
+Ascl1_late_res <- results(Ascl1_late_dds, name = "condition_nonIR_vs_IR")
+
+#visualise the results of the DESeq2 analysis in a volcano plot.
+EnhancedVolcano(Ascl1_late_res, lab = row.names(Ascl1_late_res), x = 'log2FoldChange', y = 'padj', pCutoff = 0.05, FCcutoff = 0.5, labSize = 4, cutoffLineType = "blank", xlab = "Log fold-change", ylab = "-Log adjusted p-val" ,   colAlpha = 1, legendPosition = 'right', legendLabSize = 12, legendIconSize = 4.0, drawConnectors = T) & NoLegend()
+
+#save DESeq2 as csv.
+#write.csv(Ascl1_late_res, file = "Ascl1/Ascl1_P3_P5_DESeq2.csv")
+```
+
+
+Performing GO term analysis to see, if any ROS related pathways are upregulated in the IR cells.
+```{r}
+#restructuring the DESeq2 results making it fit for GO term analysis.
+Ascl1_late_res_go <- Ascl1_late_res %>% as.tibble() %>% transform(gene = row.names(Ascl1_late_res))
+
+#identify the genes which are significantly differentially expressed in the IR cells.
+Ascl1_late_isSigGene <- Ascl1_late_res_go$padj < 0.05 & !is.na(Ascl1_late_res_go$padj) & Ascl1_late_res_go$log2FoldChange < -0.5
+Ascl1_late_genes <- as.integer(Ascl1_late_isSigGene)
+names(Ascl1_late_genes) <- Ascl1_late_res_go$gene
+
+#calculate a probability weight function for the significantly DE genes in IR cells.
+Ascl1_late_pwf <- nullp(Ascl1_late_genes, "mm8", "geneSymbol")
+
+#perform the goseq analysis.
+Ascl1_late_goResults <- goseq(Ascl1_late_pwf, "mm8","geneSymbol", test.cats=c("GO:BP"))
+
+#visualise the top 10 overrepresented GO terms.
+Ascl1_late_goResults %>% 
+    top_n(10, wt=-over_represented_pvalue) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count", title = "GO term analysis for IR cells from P3 and P5") + theme_bw()
+
+#visualisation of selected GO terms.
+Ascl1_late_goResults %>% 
+    subset(category %in% c("GO:0051093", "GO:0008283", "GO:0050793", "GO:0048505", "GO:0045595", "GO:0031326", "GO:0006978", "GO:0010468", "GO:0050767")) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count", title = "GO term analysis for IR cells from P3 and P5 of Ascl1 positive clusters") + theme_bw()
+
+
+#look a stress-related GO terms to see if any of these are significantly overrepresented.
+Ascl1_late_goResults[grep("stress", Ascl1_late_goResults$term), ]
+
+#Write a csv of the GO term results.
+#write.csv(Ascl1_late_goResults, file = "Ascl1/Ascl1_P3_P5_GO_term.csv")
+```
+
+
+Performing GO term analysis to see on down regulated genes to compare.
+```{r}
+#restructuring the DESeq2 results making it fit for GO term analysis.
+Ascl1_late_res_go <- Ascl1_late_res %>% as.tibble() %>% transform(gene = row.names(Ascl1_late_res))
+
+#identify the genes which are significantly differentially expressed in the IR cells. 
+Ascl1_late_isSigGene_nonIR <- Ascl1_late_res_go$padj < 0.05 & !is.na(Ascl1_late_res_go$padj) & Ascl1_late_res_go$log2FoldChange > 0.5
+Ascl1_late_genes_nonIR <- as.integer(Ascl1_late_isSigGene_nonIR)
+names(Ascl1_late_genes_nonIR) <- Ascl1_late_res_go$gene
+
+#calculate a probability weight function for the significantly DE genes in IR cells.
+Ascl1_late_pwf_nonIR <- nullp(Ascl1_late_genes_nonIR, "mm8", "geneSymbol")
+
+#perform the goseq analysis.
+Ascl1_late_goResults_nonIR <- goseq(Ascl1_late_pwf_nonIR, "mm8","geneSymbol", test.cats=c("GO:BP"))
+
+#visualise the top 10 overrepresented GO terms.
+Ascl1_late_goResults_nonIR %>% 
+    top_n(10, wt=-over_represented_pvalue) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count", title = "GO term analysis for IR cells from P3 and P5") + theme_bw()
+
+#visualisation of selected GO terms.
+Ascl1_late_goResults_nonIR %>% 
+    subset(category %in% c("GO:0030182", "GO:0048699", "GO:0007019", "GO:0022008", "GO:0048666", "GO:0031117", "GO:0035021", "GO:0021953")) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count", title = "GO term analysis for nonIR cells from P3 and P5 of Ascl1 positive clusters") + theme_bw()
+
+
+#look a stress-related GO terms to see if any of these are significantly overrepresented.
+Ascl1_late_goResults_nonIR[grep("stress", Ascl1_late_goResults_nonIR$term), ]
+
+#Write a csv of the GO term results.
+#write.csv(Ascl1_late_goResults_nonIR, file = "Ascl1/Ascl1_P3_P5_GO_term_nonIR.csv")
+```
