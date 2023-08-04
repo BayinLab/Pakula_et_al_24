@@ -1,5 +1,9 @@
 # Load test data from STARsolo run, process with Seurat
 
+# AUTHOR: Adam Reid
+# Copyright (C) 2023 University of Cambridge
+# This program is distributed under the terms of the GNU General Public License
+
 library(Seurat)
 library(SeuratDisk)
 library(SeuratWrappers)
