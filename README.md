@@ -4,6 +4,8 @@ Repository assosiated with Pakula et al., 2023 'Involvment of ROS in adaptive re
 ## Description of files
 NEPs_scRNAseq_processing.R - R code for processing mapped reads to generate a Seurat object with normalised, integrated, clustered and labelled cells
 
+Ascl1_DESeq2.Rmd, GCP_DESeq2.Rmd, and Hopx_DESeq2.Rmd - R code for recreating the pseudobulk analyses presented in Pakula _et al_, 2023.
+
 ## R SessionInfo for Ascl1_DESeq2.Rmd, GCP_DESeq2.Rmd, and Hopx_DESeq2.Rmd:
 R version 4.2.0 (2022-04-22)
 Platform: x86_64-pc-linux-gnu (64-bit)
