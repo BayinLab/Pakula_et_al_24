@@ -201,7 +201,7 @@ ggsave("nep.rna.combined.solo.marker.heatmap.png", width=10, height=10)
 # Assign cluster names
 new.cluster.ids <- c("GCP_1", "BgL_NEP_1", "BgL_NEP_2", "GCP_2", "Ascl1_NEP_1",
                      "BgL_NEP_3", "GCP_3", "Ascl1_NEP_2", "Astrocyte", "BgL_NEP_4",
-                     "Interneuron", "GCP_4", "Ependymal_!", "GCP_5", "Oligodendrocyte",
+                     "Interneuron", "GCP_4", "Ependymal_1", "GCP_5", "Oligodendrocyte",
                      "Meninges", "Microglia_1", "Ependymal_2", "Ependymal_3", "low_feature_count",
                      "Microglia_2")
 names(new.cluster.ids) <- levels(nep.rna.combined.solo)
