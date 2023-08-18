@@ -3,7 +3,7 @@ title: "Ros_paper"
 output: html_document
 date: '2023-02-16'
 ---
-
+# Copyright (C) 2023 University of Cambridge
 This is a script by Jens Bager Christensen (jbc53@cam.ac.uk) to perform pseudobulk analysis on HOPX-NEPs to identify their transcriptional response to neonatal injury.
 
 ```{r}
