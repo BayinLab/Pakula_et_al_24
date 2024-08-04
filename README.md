@@ -1,5 +1,5 @@
 # Pakula_et_al_23
-Repository assosiated with Pakula et al., 2023 'Involvment of ROS in adaptive reprogramming of neonatal glia after cerebellar neutron injury'.
+Repository assosiated with Pakula et al., 2023 'An increase in reactive oxygen species underlies neonatal cerebellum repair'.
 
 ## Description of files
 NEPs_scRNAseq_processing.R - R code for processing mapped reads to generate a Seurat object with normalised, integrated, clustered and labelled cells
