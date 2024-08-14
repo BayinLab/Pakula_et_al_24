@@ -1,4 +1,4 @@
-# Pakula_et_al_23
+# Pakula_et_al_24
 Repository assosiated with Pakula et al., 2023 'An increase in reactive oxygen species underlies neonatal cerebellum repair'.
 
 ## Description of files
